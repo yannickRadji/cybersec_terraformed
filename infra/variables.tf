@@ -57,3 +57,14 @@ variable "client_ip_address" {
     error_message = "client_ip_address must be a valid IPv4 address such as 203.0.113.45."
   }
 }
+
+variable "log_retention_days" {
+  type        = number
+  description = "Days to keep logs in the Log Analytics workspace (cost control)."
+  default     = 30
+
+  validation {
+    condition     = var.log_retention_days >= 30 && var.log_retention_days <= 730
+    error_message = "log_retention_days must be between 30 and 730."
+  }
+}

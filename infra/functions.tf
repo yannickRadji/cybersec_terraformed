@@ -31,6 +31,8 @@ resource "azurerm_linux_function_app" "app" {
   https_only = true
 
   site_config {
+    application_insights_connection_string = azurerm_application_insights.appi.connection_string
+
     application_stack {
       python_version = "3.11"
     }
@@ -43,6 +45,7 @@ resource "azurerm_linux_function_app" "app" {
   app_settings = {
     "SCM_DO_BUILD_DURING_DEPLOYMENT" = "true"
     "ENABLE_ORYX_BUILD"              = "true"
+    "AzureWebJobsFeatureFlags"       = "EnableWorkerIndexing" # Python v2 programming model
     "SQL_CONNECTION_STRING" = join("", [
       "Driver={ODBC Driver 18 for SQL Server};",
       "Server=tcp:${azurerm_mssql_server.sql.fully_qualified_domain_name},1433;",

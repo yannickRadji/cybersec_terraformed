@@ -17,3 +17,7 @@ output "function_app_name" {
 output "function_app_default_hostname" {
   value = azurerm_linux_function_app.app.default_hostname
 }
+
+output "app_insights_name" {
+  value = azurerm_application_insights.appi.name
+}
