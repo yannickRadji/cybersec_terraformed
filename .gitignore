@@ -3,6 +3,7 @@
 *.tfstate.*
 *.tfvars
 *_override.tf.json
+**/tfplan
 .venv/
 src/local.settings.json
 __pycache__/

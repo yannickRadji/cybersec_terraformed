@@ -8,7 +8,7 @@
 You will build and then harden a small cloud ingestion service: an Azure Linux Function App (Python 3.11) that stores data in an Azure SQL Database (serverless). All infrastructure is declared with Terraform; the Azure Portal is used only to **observe** results. Monitoring (Application Insights) is part of the infrastructure from the very first `terraform apply`, because on this hosting plan it is your **only** way to see what the Function does: the command-line log stream is not available on Linux Consumption.
 
 - **Phase 1 – Functional baseline:** provision (with monitoring), run the code locally against the real database, publish it, test it with curl and Postman.
-- **Phase 2 – Hardening:** authentication, input validation, secret management, least-privilege database roles.
+- **Phase 2 – Hardening:** authentication, input validation, secret management, least-privilege database roles, network segregation.
 - **Troubleshooting reference:** a guide to reading the logs. It is **not a step** of the exercise: use it only when something fails.
 
 ```
@@ -902,6 +902,7 @@ az monitor app-insights query --app $Appi --resource-group $Rg --analytics-query
 | `SQL_CONNECTION_STRING is not configured` | App setting missing | Function App → *Environment variables* (cloud) or `local.settings.json` (local) |
 | `Unable to create client for AzureWebJobsStorage` (local only) | Azurite not running or storage setting empty | Step 4.3, item 2 |
 | Nothing at all in `requests` | Function not registered or telemetry not connected | Step 4.5; check `APPLICATIONINSIGHTS_CONNECTION_STRING` exists in *Environment variables* |
+| After section 6.5 (private database): `Public network access is disabled` from your PC, or a timeout from the Function | Network path closed or DNS not resolving privately | Section 6.5, checks and troubleshooting |
 
 Fix the cause, republish only if code changed (`func azure functionapp publish $FuncName`), and call the API again.
 
@@ -1017,8 +1018,257 @@ ALTER ROLE name_editor ADD MEMBER app_editor_user;
 
 Generate unique passwords (a password manager helps); never copy example passwords from documents. Store each connection string as its own Key Vault secret: the POST function gets the *editor* login, a new GET function gets the *reader* login. Then deliberately point POST at the reader login and find the permission error (`The UPDATE permission was denied` or similar) in the `exceptions` table. In 5–10 lines, explain why two narrow roles are safer than one `db_owner` account.
 
-### 6.5 Tighten the network (discussion, optional implementation)
-The `AllowAzureServices` rule (0.0.0.0) lets resources of *any* Azure customer attempt to reach your server. List the controls that reduce exposure (private endpoint, disabling public network access, VNet integration, access restrictions on the Function) and note which need a hosting plan other than Y1.
+### 6.5 Network segregation (Function and database)
+
+**Principle.** Network segmentation limits who can *reach* a component, independently of who can *authenticate* to it. It is a layer of defense in depth: if a password or key leaks, the attacker still needs a network path. The goal is that no component is reachable from the internet unless it has to be, and every remaining path is explicit.
+
+Do this section **after** 6.1–6.4 and **after** you have finished every task that needs direct access to the database from your PC (table creation, role creation, local runs of Step 4.3). Part of this section closes that access on purpose.
+
+#### 6.5.1 Map the exposure first (exercise, 10 minutes)
+
+Fill in this table for your own deployment (Portal: *Networking* blade of each resource) before changing anything:
+
+| Component | Reachable today from | Control that reduces exposure | What it requires |
+|---|---|---|---|
+| Function inbound (devices call it) | The whole internet (this is required) | Authentication (6.1), rate limiting and a Web Application Firewall or API gateway in front; IP restrictions only if callers have fixed IPs | Access restrictions work on every plan |
+| Function outbound (calls to SQL, Key Vault) | Anywhere (no control) | Virtual network integration plus network rules on the subnet | Not available on the Consumption (Y1) plan; available on Flex Consumption, Elastic Premium, Dedicated |
+| SQL server | Internet, filtered by firewall rules (your IP, and the 0.0.0.0 "Azure services" rule) | Remove the 0.0.0.0 rule; private endpoint; deny public network access | A private endpoint needs a virtual network; for the Function to use it, the Function needs outbound VNet integration |
+| Key Vault | Internet, protected by RBAC | Private endpoint; deny public access | Same constraint as the database |
+| Function storage account | Internet, protected by keys | Private endpoints for blob/file; deny public access | Needs a plan with VNet integration |
+| Terraform state storage | Internet, protected by Entra ID and RBAC | Network rules on the account | Your workstation must stay allowed |
+
+**The key constraint.** Microsoft documents that the Consumption plan does not support outbound virtual network integration and does not support private endpoints for the function app; Flex Consumption, Elastic Premium and Dedicated (App Service) plans do. That means **a database reachable only through a private endpoint cannot be used by a Function on the Y1 plan we deployed**. Two levels follow: what you can do on Y1 (Level 1), and what requires moving to another plan (Level 2).
+
+#### 6.5.2 Level 1 — narrow the exposure on the current plan (Y1)
+
+**a) Remove the "Azure services" firewall rule.** The `0.0.0.0` rule (`AllowAzureServices`) lets resources of *any* Azure customer attempt to connect to your server. Replace it with one rule per outbound IP address of your Function. Add to `sql.tf` and **delete** the `allow_azure_services` resource:
+
+```hcl
+locals {
+  function_outbound_ips = toset(split(",", azurerm_linux_function_app.app.possible_outbound_ip_addresses))
+}
+
+resource "azurerm_mssql_firewall_rule" "function_outbound" {
+  for_each         = local.function_outbound_ips
+  name             = "func-${replace(each.value, ".", "-")}"
+  server_id        = azurerm_mssql_server.sql.id
+  start_ip_address = each.value
+  end_ip_address   = each.value
+}
+```
+
+Notes: `for_each` needs values known at plan time, so this works because the Function App already exists in the state (on a first deployment from scratch Terraform would refuse; that is why this is a Phase 2 change). If `validate` rejects the attribute name, check the `azurerm_linux_function_app` documentation of your installed provider version. List the addresses yourself with `az functionapp show --name $FuncName --resource-group $Rg --query possibleOutboundIpAddresses -o tsv`.
+
+**Limit of this control (write it down):** on Consumption, these addresses come from a pool shared with other customers' apps, and the set can change when Azure moves your app. The rule is narrower than `0.0.0.0` but it is a filter, not isolation, and a change of addresses causes an outage until you apply again.
+
+**b) Make the workstation rule switchable.** Your own IP should be allowed only while you work on the database. Add a variable and a condition:
+
+```hcl
+variable "allow_workstation_access" {
+  type        = bool
+  description = "Allow the student workstation IP through the SQL firewall."
+  default     = true
+}
+```
+
+```hcl
+resource "azurerm_mssql_firewall_rule" "allow_student_ip" {
+  count            = var.allow_workstation_access ? 1 : 0
+  name             = "AllowStudentWorkstation"
+  server_id        = azurerm_mssql_server.sql.id
+  start_ip_address = var.client_ip_address
+  end_ip_address   = var.client_ip_address
+}
+```
+
+Apply with `-var="allow_workstation_access=false"` to close the path, and with `true` for a maintenance window. When you add `count`, the resource address becomes `azurerm_mssql_firewall_rule.allow_student_ip[0]`; Terraform will plan a replacement, which is acceptable here.
+
+**c) Function inbound.** Callers (devices) are everywhere, so IP allow-lists are usually impossible; rely on 6.1 and add a gateway or WAF in front in a real project. You can however restrict the *deployment/management* endpoint (the SCM site) to your own IP with `scm_ip_restriction` in `site_config`, at the price that publishing then works only from allowed addresses. Discuss when that trade-off is worth it.
+
+**Check Level 1:** call the API (it must still work and the counter must increment), then confirm from another Azure Function or from an IP that is not in the list that a connection to the server is refused. In Application Insights a failure would appear as a `Cannot open server ... Client with IP address ... is not allowed` exception.
+
+#### 6.5.3 Level 2 — a private database (requires another hosting plan)
+
+**Target design**
+
+```
+ Internet --HTTPS (key auth)--> Function App (public inbound)
+                                     | regional VNet integration
+                                     v
+ VNet 10.10.0.0/16
+   ├─ snet-func  10.10.1.0/24   Function outbound (delegated subnet)
+   └─ snet-pe    10.10.2.0/24   private endpoints
+          └─ private endpoint ──► SQL server (private IP 10.10.2.x)
+              DNS: privatelink.database.windows.net (private DNS zone linked to the VNet)
+
+ SQL server: public network access DISABLED, no firewall rules
+```
+
+The Function is the only client that can reach the database, and only through the private subnet. Segregation is by *subnet role*: one subnet for compute, one for private endpoints, no resource in both.
+
+**Before you start**
+1. Finish all work that needs your PC to reach the database (table, roles, tests). Afterwards `sqlcmd` and the local run of Step 4.3 will fail by design.
+2. Cost: private endpoints are billed per hour and per data volume, and Premium plans are expensive. Do the validation in one session and run `terraform destroy` at the end. Check current prices on the Azure pricing pages.
+3. Register the provider needed for the delegated subnet of Flex Consumption: `az provider register --namespace Microsoft.App`.
+
+**Step A — change the hosting plan to Flex Consumption.** Flex is still serverless (scales with demand, pay per use) and supports outbound VNet integration and private endpoints; this keeps the architecture argument of the course (unpredictable number of devices). The alternatives are Elastic Premium or a Dedicated plan: both work but cost more and are not scale-to-zero. This is a **replacement** of the Function App: Terraform destroys the Y1 app and creates a new one, so you must publish the code again afterwards.
+
+> Treat the following block as a skeleton. The Flex Consumption resource differs from `azurerm_linux_function_app` (runtime is `runtime_name`/`runtime_version`, code is deployed from a blob container, some arguments such as `https_only` do not exist). Run `terraform validate`, read each error, and check the documentation of `azurerm_function_app_flex_consumption` for your provider version. Expect to debug: this is a real migration.
+
+In `functions.tf`: change the plan `sku_name` to `"FC1"`, add the container, and replace the Function resource:
+
+```hcl
+resource "azurerm_storage_container" "deploy" {
+  name                  = "app-package"
+  storage_account_id    = azurerm_storage_account.func_sa.id
+  container_access_type = "private"
+}
+
+resource "azurerm_function_app_flex_consumption" "app" {
+  name                = "func-namecounter-${var.environment}-${random_string.suffix.result}"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  service_plan_id     = azurerm_service_plan.asp.id
+
+  storage_container_type      = "blobContainer"
+  storage_container_endpoint  = "${azurerm_storage_account.func_sa.primary_blob_endpoint}${azurerm_storage_container.deploy.name}"
+  storage_authentication_type = "StorageAccountConnectionString"
+  storage_access_key          = azurerm_storage_account.func_sa.primary_access_key
+
+  runtime_name           = "python"
+  runtime_version        = "3.11"
+  maximum_instance_count = 40
+  instance_memory_in_mb  = 2048
+
+  virtual_network_subnet_id = azurerm_subnet.func.id # Step B
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  site_config {
+    application_insights_connection_string = azurerm_application_insights.appi.connection_string
+  }
+
+  app_settings = {
+    "SQL_CONNECTION_STRING" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault_secret.sql_conn.versionless_id})"
+  }
+
+  tags = azurerm_resource_group.rg.tags
+}
+```
+
+Then update every reference to the old resource: `keyvault.tf` (`azurerm_linux_function_app.app.identity[0].principal_id`) and `outputs.tf` (`name`, `default_hostname`) must point to `azurerm_function_app_flex_consumption.app`. Remove the old `azurerm_linux_function_app` block.
+
+**Step B — the network.** New file `infra\network.tf`:
+
+```hcl
+resource "azurerm_virtual_network" "vnet" {
+  name                = "vnet-namecounter-${var.environment}"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  address_space       = ["10.10.0.0/16"]
+
+  tags = azurerm_resource_group.rg.tags
+}
+
+resource "azurerm_subnet" "func" {
+  name                 = "snet-func"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.10.1.0/24"]
+
+  delegation {
+    name = "flex-consumption"
+    service_delegation {
+      name    = "Microsoft.App/environments"
+      actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+    }
+  }
+}
+
+resource "azurerm_subnet" "pe" {
+  name                 = "snet-private-endpoints"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.10.2.0/24"]
+}
+
+resource "azurerm_private_dns_zone" "sql" {
+  name                = "privatelink.database.windows.net"
+  resource_group_name = azurerm_resource_group.rg.name
+
+  tags = azurerm_resource_group.rg.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "sql" {
+  name                  = "link-sql"
+  resource_group_name   = azurerm_resource_group.rg.name
+  private_dns_zone_name = azurerm_private_dns_zone.sql.name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+}
+
+resource "azurerm_private_endpoint" "sql" {
+  name                = "pe-sql-${var.environment}"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  subnet_id           = azurerm_subnet.pe.id
+
+  private_service_connection {
+    name                           = "psc-sql"
+    private_connection_resource_id = azurerm_mssql_server.sql.id
+    subresource_names              = ["sqlServer"]
+    is_manual_connection           = false
+  }
+
+  private_dns_zone_group {
+    name                 = "sql-dns"
+    private_dns_zone_ids = [azurerm_private_dns_zone.sql.id]
+  }
+
+  tags = azurerm_resource_group.rg.tags
+}
+```
+
+Why the DNS zone matters: the application keeps using the same server name (`<server>.database.windows.net`). The private DNS zone, linked to your VNet, makes that name resolve to the private IP of the endpoint for resources inside the VNet. Without it the Function would still resolve the public address and fail once public access is closed. Azure SQL's private endpoint subresource is `sqlServer`.
+
+**Step C — close the public door.** In `sql.tf`: add `public_network_access_enabled = false` to `azurerm_mssql_server.sql`, and delete **all** `azurerm_mssql_firewall_rule` resources (the `0.0.0.0` rule, the workstation rule, and any Level 1 rules). Adding a private endpoint alone does *not* disable public access: the "deny public network access" setting is separate and is off by default.
+
+**Step D — apply and publish.**
+
+```powershell
+cd C:\Dev\cybersec_terraformed\infra
+terraform plan -out=tfplan      # read it: the Function App is replaced, a VNet, 2 subnets, a DNS zone and a private endpoint are added
+terraform apply tfplan
+cd ..\src
+$FuncName = terraform -chdir="..\infra" output -raw function_app_name
+func azure functionapp publish $FuncName
+```
+
+**Checks (record each result)**
+
+| Check | Command or action | Expected |
+|---|---|---|
+| Public access is off | `az sql server show --name <server> --resource-group $Rg --query publicNetworkAccess -o tsv` | `Disabled` |
+| Private endpoint is approved | Portal → SQL server → *Networking* → *Private access* | Connection state `Approved` |
+| Your PC is locked out | `sqlcmd -S $Server -d NameCounterDB -U secopsadmin -P "<password>" -N -Q "SELECT 1"` | Fails with a message saying public network access is denied or not allowed |
+| The Function still works | Call the deployed API with Alice | Counter increments (the private path works) |
+| The name still resolves | `nslookup <server>.database.windows.net` from your PC | Resolves to a public address or the `privatelink` alias; only resources inside the VNet get the private IP |
+
+**If the Function now fails** (look in Application Insights): `Login timeout expired` usually means a network problem, not a SQL problem. Check in this order: the DNS zone is linked to the VNet; the private endpoint connection is `Approved`; the Function has VNet integration on the delegated `snet-func` subnet; `Microsoft.App` is registered; the Function was republished after the replacement.
+
+**How to work on the database afterwards.** Direct access from your PC is closed, which is the point. For a maintenance window, set `public_network_access_enabled = true` and re-add a single `/32` rule for your IP, apply, do the work, then revert and apply again. More robust options, outside this lab, are a jump host or Azure Bastion inside the VNet, or a deployment pipeline running inside the VNet.
+
+#### 6.5.4 Other components (discussion)
+
+Which of the following are worth segregating in a real project, and which would you leave for later? Justify using risk and cost: Key Vault (private endpoint `privatelink.vaultcore.azure.net`, deny public access), the Function's storage account (private endpoints for blob and file), Application Insights (private link scope), the Terraform state account (network rules that still allow your workstation or pipeline). Also consider network security groups on each subnet (allow only the flows that exist: Function subnet to private-endpoint subnet on port 1433) and outbound control from the Function subnet.
+
+#### 6.5.5 What segregation does not fix (write your answers)
+
+1. The Function is still publicly callable: which earlier controls (6.1, 6.2, monitoring) protect it?
+2. A compromised Function still has a legitimate path to the database: which control limits the damage (6.4)?
+3. Secrets and the state file are untouched by the network: where do they live, and who can read them?
+4. Draw the before/after picture of who can reach what, and name one attack that is now impossible and one that is still possible.
 
 ### 6.6 Monitoring as a security control (discussion)
 Use the `requests` table to answer: how many calls per hour? how many rejected (4xx)? from which IPs (`client_IP`)? Which of your Phase 2 controls produces a visible signal, and which one would an attacker be able to exploit without leaving any trace? Which alert would you create first (for example a spike of 401/403 responses)? Detection and response (identify, protect, detect, respond, recover) depend on logs existing before the incident.
@@ -1033,7 +1283,7 @@ terraform destroy
 az group list --query "[?starts_with(name, 'rg-namecounter')].name" -o tsv
 ```
 
-The second command should print nothing (the workspace and Application Insights are deleted with the resource group). The state resource group `rg-tfstate-prod` is intentionally **not** managed by this project and stays (negligible cost); delete it at the end of the course with `az group delete --name rg-tfstate-prod`.
+The second command should print nothing (the workspace, Application Insights, VNet, DNS zone and private endpoints are deleted with the resource group). The state resource group `rg-tfstate-prod` is intentionally **not** managed by this project and stays (negligible cost); delete it at the end of the course with `az group delete --name rg-tfstate-prod`.
 
 ---
 
@@ -1067,4 +1317,4 @@ except requests.RequestException as exc:
     print("network error:", exc)
 ```
 
-The same controls apply: TLS in transit, authentication, input validation, secrets outside source code, least-privilege storage, and logs you can read. Devices with little memory and compute do the minimum locally (sample, filter, summarise) and let the stateless cloud function persist the result in a database; with many devices of unpredictable activity, the serverless layer scales on demand.
+The same controls apply: TLS in transit, authentication, input validation, secrets outside source code, least-privilege storage, network segregation, and logs you can read. Devices with little memory and compute do the minimum locally (sample, filter, summarise) and let the stateless cloud function persist the result in a database; with many devices of unpredictable activity, the serverless layer scales on demand.

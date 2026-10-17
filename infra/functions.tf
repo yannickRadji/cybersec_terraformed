@@ -46,13 +46,7 @@ resource "azurerm_linux_function_app" "app" {
     "SCM_DO_BUILD_DURING_DEPLOYMENT" = "true"
     "ENABLE_ORYX_BUILD"              = "true"
     "AzureWebJobsFeatureFlags"       = "EnableWorkerIndexing" # Python v2 programming model
-    "SQL_CONNECTION_STRING" = join("", [
-      "Driver={ODBC Driver 18 for SQL Server};",
-      "Server=tcp:${azurerm_mssql_server.sql.fully_qualified_domain_name},1433;",
-      "Database=${azurerm_mssql_database.db.name};",
-      "Uid=${var.sql_admin_login};Pwd=${var.sql_admin_password};",
-      "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
-    ])
+    "SQL_CONNECTION_STRING" = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault_secret.sql_conn.versionless_id})"
   }
 
   tags = azurerm_resource_group.rg.tags
