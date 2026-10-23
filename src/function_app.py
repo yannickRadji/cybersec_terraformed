@@ -5,6 +5,8 @@ import os
 import azure.functions as func
 import pyodbc
 
+from sanitize import validate_name
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 logger = logging.getLogger("namecounter")
 
@@ -16,7 +18,7 @@ def json_response(body: dict, status: int) -> func.HttpResponse:
 @app.route(route="http_trigger", methods=["POST"])
 def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        name = req.get_json().get("name")
+        name = validate_name(req.get_json().get("name"))
     except ValueError:
         logger.warning("Rejected request: body is not valid JSON")
         return json_response({"error": "Body must be valid JSON."}, 400)
